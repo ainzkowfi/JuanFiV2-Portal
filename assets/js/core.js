@@ -1301,7 +1301,7 @@ function bootRest() {
 	// is written by the coin-extend path right before document.logout.submit();
 	// interrupt that hand-off and it survives, so every later boot takes the
 	// fast path below and doLogin()s straight back in. Skipping the fast path
-	// lets detectState() resolve "paused" and checkStalePause() take over.
+	// lets detectState() resolve "paused" and the paused view take over.
 	if (getReLoginFlag() == '1' && getPausedFlag() != "1") {
 		removeReLoginFlag();
 		// NO prefill here: the venue scope is still unknown, so a read now
@@ -1359,15 +1359,17 @@ function bootRest() {
 		try { dbgLog("boot state=" + state); } catch (e) { }
 		bootStateKnown = true;
 		render(state);
-		// Paused: show the view first, then verify it is still resumable.
+		// Paused: show the view, and leave it up. Whether the code behind the
+		// pause is still good is not decided here any more -- a refresh (or a
+		// phone waking up on a paused tab) must not throw the customer off the
+		// paused view. RESUME asks, and only RESUME.
 		// Waiting on every job here meant a dead ESP held the customer behind
 		// the loader for 5s for a page they were only trying to look at.
 		// Router calls (expiry, net) still run; only loadRates is deferred
 		// until after the reveal because that is the one that waits on the ESP.
 		if (state == "paused") {
 			setTimeout(hideBoot, 120);
-			timedStep("Loading session", showValidity(), true);
-			timedStep("Checking session", checkStalePause(), true).always(function () {
+			timedStep("Loading session", showValidity(), true).always(function () {
 				try { loadRates(); } catch (e) {}
 			});
 			return;
@@ -1444,8 +1446,8 @@ function detectState() {
 			// Router says logged out. A pause flag means the customer left on
 			// purpose, keep them paused instead of auto-logging them back in.
 			// (Dropping the flag here is what made every refresh resurrect the
-			// session.) Validity of the pause itself is checked async by
-			// checkStalePause() once the paused view is up.
+			// session.) Whether the pause is still worth anything is not asked
+			// here: the paused view stays up until RESUME is tapped.
 			if (getPausedFlag() == "1") {
 				// A resume the router rejected ends the pause. resume() leaves
 				// __resumePending AND isPaused set while it waits for the router's
@@ -2388,9 +2390,6 @@ function setPortalState(s) {
 	$("#view-login").attr("style", s == "login" ? "display: block" : "display: none");
 	$("#view-status").attr("style", s == "status" ? "display: block" : "display: none");
 	$("#view-paused").attr("style", s == "paused" ? "display: block" : "display: none");
-	// Paused is the only view that can sit on screen long after the code behind
-	// it is gone; keep it honest while it is up, stop watching once it is not.
-	try { if (s == "paused") { startPauseWatch(); } else { stopPauseWatch(); } } catch (e) { }
 	$("#ratesSection").attr("style", "display: block");
 	$("#saveVoucherButton").attr('data-save-type', s == "status" ? "extend" : "purchase");
 	if (bootDone && (s == "status" || s == "paused") && window.__validityFor != voucher) {
@@ -2482,13 +2481,11 @@ function rateDisplay(raw, priceHint) {
 
 // Session resume. Login page.
 
-// The pause itself can outlive the code it was holding. The per-MAC session
-// file is the only client-side signal that the code still exists: On-Login
-// writes it, the expiry scheduler deletes it. Missing / empty / past validity
-// = the code is gone and there is nothing left to resume into.
+// Drop a pause whose code is gone, after RESUME found that out. Called from
+// resume() only: nothing else ends a pause on the customer's behalf any more.
 function clearStalePause(msg) {
 	try {
-		// Same precedence as checkStalePause/resume: clear the keys of the
+		// Same precedence as pauseCanResume/resume: clear the keys of the
 		// code this page is actually holding.
 		var vc = voucher || getActiveVoucher();
 		if (vc) { removeVouchValue(vc, "remain"); removeVouchValue(vc, "tempValidity"); removeVouchValue(vc, "validity"); }
@@ -2496,26 +2493,35 @@ function clearStalePause(msg) {
 		removePausedFlag();
 		insertingCoin = false;
 		voucher = "";
-		try { $("#voucherInput").val(""); } catch (e) {}
+		// The box keeps the code. An empty field makes the customer retype a
+		// code they are still holding, and they cannot see which one ended.
 		if (msg && !getSessionValue("__stalePauseWarned")) {
 			try { setSessionValue("__stalePauseWarned", "1"); } catch (e) {}
 			$.toast({ title: 'Session ended', content: msg, type: 'warning', delay: 6000 });
 		}
 	} catch (e) {}
 }
-function checkStalePause() {
+// A pause can outlive the code it was holding. The per-MAC session file is
+// the only client-side signal that the code still exists: On-Login writes it,
+// the expiry scheduler deletes it. Resolves true when RESUME may go ahead,
+// false when it must send the customer back to the login view instead.
+//
+// Read-only on purpose. This used to run on every boot and every 30s, and it
+// cleared the pause behind the customer's back: a refresh, or simply coming
+// back to the tab, threw them off the paused view with "session not valid"
+// before they had tapped anything. The paused view now stays put, and the
+// verdict is asked exactly once -- when RESUME is tapped.
+function pauseCanResume() {
 	var d = $.Deferred();
-	if (getPausedFlag() != "1") { d.resolve(false); return d.promise(); }
+	if (getPausedFlag() != "1") { d.resolve(true); return d.promise(); }
 	// Paused at 00:00:00: pause() banked zero seconds, so there is nothing to
 	// resume into. The router session file can outlive the purchased session,
-	// so the file test below would keep a dead pause on screen behind a RESUME
-	// that can only fail. -1 is pause()'s "remaining unknown" marker.
+	// so the file test below alone would let a RESUME that can only fail
+	// through. -1 is pause()'s "remaining unknown" marker.
 	var banked = parseInt(getVouchValue(voucher || getActiveVoucher(), "remain"), 10);
 	if (banked === 0) {
-		try { dbgLog("stale pause: no time left to resume, clearing"); } catch (e) {}
-		clearStalePause("Your time has run out.");
-		try { render("login"); } catch (e) {}
-		d.resolve(true);
+		try { dbgLog("resume check: no time left to resume"); } catch (e) {}
+		d.resolve(false);
 		return d.promise();
 	}
 	$.ajax({ type: "GET", url: "/data/" + macNoColon() + ".txt?query=" + new Date().getTime(), timeout: ROUTER_TIMEOUT })
@@ -2524,77 +2530,20 @@ function checkStalePause() {
 		var hash = str.lastIndexOf("#");
 		var fv = (hash < 0 ? str : str.slice(0, hash)).trim();
 		var vu = hash < 0 ? null : parseValidity(str.slice(hash + 1));
-		var stale = (!fv || vu == null || vu.getTime() < new Date().getTime());
-		if (stale) {
-			try { dbgLog("stale pause: session file gone, clearing"); } catch (e) {}
-			// clearStalePause clears the flag and storage, then render() shows
-			// the login view. Order matters: render last, or the paused view
-			// is re-painted with a voucher that no longer exists.
-			clearStalePause("This session is no longer valid.");
-			try { render("login"); } catch (e) {}
-		}
-		d.resolve(stale);
+		var ok = (fv != "" && vu != null && vu.getTime() >= new Date().getTime());
+		try { dbgLog("resume check: " + (ok ? "session file still valid" : "session file empty or past")); } catch (e) {}
+		d.resolve(ok);
 	})
 	.fail(function (jqXHR) {
-		// A 404 is the router answering, not the network failing. The scheduler's
-		// on-event deletes data/<mac>.txt when the voucher ends, so a customer
-		// whose code ran out while paused was left watching a countdown to a
-		// session that no longer existed, with no error and no way out but
-		// guessing to tap RESUME. status 0 is a real network failure, which is
-		// not evidence the session ended, so the pause stays there.
+		// A 404 is the router answering, not the network failing: the file was
+		// deleted with the voucher. Any other status is a hiccup and no proof
+		// at all, so the RESUME goes ahead and the router rules on the code.
 		var gone = false;
 		try { gone = (jqXHR && jqXHR.status === 404); } catch (e) {}
-		if (gone) {
-			try { dbgLog("stale pause: session file 404, clearing"); } catch (e) {}
-			clearStalePause("This session is no longer valid.");
-			try { render("login"); } catch (e) {}
-			d.resolve(true);
-			return;
-		}
-		try { dbgLog("stale-pause check failed, keeping paused view"); } catch (e) {}
-		d.resolve(false);
+		try { dbgLog("resume check: file fetch " + (gone ? "404, code gone" : "failed, letting the login decide")); } catch (e) {}
+		d.resolve(!gone);
 	});
 	return d.promise();
-}
-
-// Paused-view watchdog. The paused screen is the one view that can sit on a
-// phone for hours, and nothing else re-reads the router while it is up: the
-// status page's refresh timer skips paused, and boot's single
-// checkStalePause() finished long ago. So a code whose validity ended
-// mid-pause left the paused UI (plus a RESUME button that can only fail) on
-// screen instead of the login page. Re-run the same staleness test on a
-// timer, and the moment the page is looked at again.
-var PAUSE_WATCH_MS = 30000;
-var __pauseWatchTimer = null;
-var __pauseWatchBusy = false;
-function stopPauseWatch() {
-	try { if (__pauseWatchTimer) { clearInterval(__pauseWatchTimer); __pauseWatchTimer = null; } } catch (e) { }
-}
-function pauseWatchTick() {
-	try {
-		if (typeof STATE === 'undefined' || STATE !== "paused") { stopPauseWatch(); return; }
-		if (__pauseWatchBusy) { return; }
-		// A hidden tab is not reading the countdown; waking it re-checks below.
-		if (typeof document !== 'undefined' && document.hidden) { return; }
-		__pauseWatchBusy = true;
-		try { checkStalePause().always(function () { __pauseWatchBusy = false; }); }
-		catch (e) { __pauseWatchBusy = false; }
-	} catch (e) { __pauseWatchBusy = false; }
-}
-function startPauseWatch() {
-	if (!__pauseWatchTimer) { __pauseWatchTimer = setInterval(pauseWatchTick, PAUSE_WATCH_MS); }
-	if (window.__pauseWatchBound) { return; }
-	window.__pauseWatchBound = true;
-	// A phone in a pocket keeps the tab hidden, and a frozen timer never fires;
-	// unlocking it is exactly when the customer finds out the code is gone.
-	// pageshow covers a back/forward-cache restore of an old paused page.
-	try {
-		document.addEventListener("visibilitychange", function () { if (!document.hidden) { pauseWatchTick(); } });
-	} catch (e) { }
-	try {
-		window.addEventListener("pageshow", function () { pauseWatchTick(); });
-		window.addEventListener("focus", function () { pauseWatchTick(); });
-	} catch (e) { }
 }
 
 function resumeSession() {
@@ -3571,11 +3520,33 @@ function resume() {
 	// made a failed RESUME land on the login view with the pause forgotten,
 	// and the next refresh would auto-login anyway.
 	if (!vc) { removePausedFlag(); location.reload(); return; }
-	voucher = vc;
-	setActiveVoucher( vc);
-	$('#voucherInput').val(vc);
-	try { setSessionValue("__resumePending", "1"); } catch (e) {}
-	doLogin();
+	// Look at the session file before submitting anything. A pause can outlive
+	// the code it held; submitting a dead one lands on the router's login page
+	// with an error the customer did not ask for. Checking first sends them
+	// straight to the login view when the code is gone, and leaves a good code
+	// alone on the way to the status page.
+	var rbtn = null;
+	try { rbtn = $("#resumeBtn"); rbtn.prop("disabled", true); } catch (e) {}
+	pauseCanResume().always(function () {
+		try { if (rbtn) { rbtn.prop("disabled", false); } } catch (e) {}
+	}).done(function (ok) {
+		if (!ok) {
+			try { dbgLog("resume: code no longer resumable, back to login", "dbg-err"); } catch (e) {}
+			// Order matters: clear the flag and storage first, then show the
+			// login view, or the paused view is repainted for a dead code.
+			clearStalePause("This code has finished. Insert a coin or log in again.");
+			try { render("login"); } catch (e) {}
+			return;
+		}
+		// Keep the flag until the router rules on the code: dropping it first
+		// made a failed RESUME land on the login view with the pause forgotten,
+		// and the next refresh would auto-login anyway.
+		voucher = vc;
+		setActiveVoucher( vc);
+		$('#voucherInput').val(vc);
+		try { setSessionValue("__resumePending", "1"); } catch (e) {}
+		doLogin();
+	});
 }
 
 function notifyCoinSlotError(errorCode) {
