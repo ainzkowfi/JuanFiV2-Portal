@@ -273,7 +273,7 @@
 		<form name="logout" action="/portal/logout" style="display:none" aria-hidden="true"></form>
 
 		<script src="assets/js/jquery.min.js?v=26"></script>
-		<script src="assets/js/core.js?v=230"></script>
+		<script src="assets/js/core.js?v=234"></script>
 		<script>
 			// Router shells override form actions via globals before this runs.
 			if (window.loginAction) { document.sendin.action = window.loginAction; }
@@ -326,6 +326,16 @@
 				try { if (typeof rememberSubmitted === "function") { rememberSubmitted(vc); } } catch (e) { }
 
 		mergeTempValidity(vc);
+			// The code just submitted IS this phone's voucher from now on. It used
+			// to be adopted only from the status page, so on any router whose
+			// status page does not expose the code the portal kept holding the
+			// PREVIOUS one -- and the next things that reach for it are RESUME and
+			// PAUSE, which put the customer back on the old voucher after they
+			// had typed a new one.
+			try { window.voucher = vc; window.currentVoucher = vc; } catch (e) {}
+			// Persist only once the venue scope is known: a write now would land
+			// in the "ERROR SITE ID" bucket that adoptScopedVoucher() never reads.
+			try { if (typeof siteScopeReady === "function" && siteScopeReady()) { setActiveVoucher(vc); } } catch (e) {}
 			document.sendin.username.value = vc;
 			// Post-login landing: router redirects to the pre-login URL
 			// (stock dst behavior). Empty = router default (status page).

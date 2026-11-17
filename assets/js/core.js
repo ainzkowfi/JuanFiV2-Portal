@@ -2388,6 +2388,9 @@ function setPortalState(s) {
 	$("#view-login").attr("style", s == "login" ? "display: block" : "display: none");
 	$("#view-status").attr("style", s == "status" ? "display: block" : "display: none");
 	$("#view-paused").attr("style", s == "paused" ? "display: block" : "display: none");
+	// Paused is the only view that can sit on screen long after the code behind
+	// it is gone; keep it honest while it is up, stop watching once it is not.
+	try { if (s == "paused") { startPauseWatch(); } else { stopPauseWatch(); } } catch (e) { }
 	$("#ratesSection").attr("style", "display: block");
 	$("#saveVoucherButton").attr('data-save-type', s == "status" ? "extend" : "purchase");
 	if (bootDone && (s == "status" || s == "paused") && window.__validityFor != voucher) {
@@ -2485,7 +2488,9 @@ function rateDisplay(raw, priceHint) {
 // = the code is gone and there is nothing left to resume into.
 function clearStalePause(msg) {
 	try {
-		var vc = getActiveVoucher() || voucher;
+		// Same precedence as checkStalePause/resume: clear the keys of the
+		// code this page is actually holding.
+		var vc = voucher || getActiveVoucher();
 		if (vc) { removeVouchValue(vc, "remain"); removeVouchValue(vc, "tempValidity"); removeVouchValue(vc, "validity"); }
 		removeActiveVoucher();
 		removePausedFlag();
@@ -2501,6 +2506,18 @@ function clearStalePause(msg) {
 function checkStalePause() {
 	var d = $.Deferred();
 	if (getPausedFlag() != "1") { d.resolve(false); return d.promise(); }
+	// Paused at 00:00:00: pause() banked zero seconds, so there is nothing to
+	// resume into. The router session file can outlive the purchased session,
+	// so the file test below would keep a dead pause on screen behind a RESUME
+	// that can only fail. -1 is pause()'s "remaining unknown" marker.
+	var banked = parseInt(getVouchValue(voucher || getActiveVoucher(), "remain"), 10);
+	if (banked === 0) {
+		try { dbgLog("stale pause: no time left to resume, clearing"); } catch (e) {}
+		clearStalePause("Your time has run out.");
+		try { render("login"); } catch (e) {}
+		d.resolve(true);
+		return d.promise();
+	}
 	$.ajax({ type: "GET", url: "/data/" + macNoColon() + ".txt?query=" + new Date().getTime(), timeout: ROUTER_TIMEOUT })
 	.done(function (data) {
 		var str = String(data == null ? "" : data);
@@ -2538,6 +2555,46 @@ function checkStalePause() {
 		d.resolve(false);
 	});
 	return d.promise();
+}
+
+// Paused-view watchdog. The paused screen is the one view that can sit on a
+// phone for hours, and nothing else re-reads the router while it is up: the
+// status page's refresh timer skips paused, and boot's single
+// checkStalePause() finished long ago. So a code whose validity ended
+// mid-pause left the paused UI (plus a RESUME button that can only fail) on
+// screen instead of the login page. Re-run the same staleness test on a
+// timer, and the moment the page is looked at again.
+var PAUSE_WATCH_MS = 30000;
+var __pauseWatchTimer = null;
+var __pauseWatchBusy = false;
+function stopPauseWatch() {
+	try { if (__pauseWatchTimer) { clearInterval(__pauseWatchTimer); __pauseWatchTimer = null; } } catch (e) { }
+}
+function pauseWatchTick() {
+	try {
+		if (typeof STATE === 'undefined' || STATE !== "paused") { stopPauseWatch(); return; }
+		if (__pauseWatchBusy) { return; }
+		// A hidden tab is not reading the countdown; waking it re-checks below.
+		if (typeof document !== 'undefined' && document.hidden) { return; }
+		__pauseWatchBusy = true;
+		try { checkStalePause().always(function () { __pauseWatchBusy = false; }); }
+		catch (e) { __pauseWatchBusy = false; }
+	} catch (e) { __pauseWatchBusy = false; }
+}
+function startPauseWatch() {
+	if (!__pauseWatchTimer) { __pauseWatchTimer = setInterval(pauseWatchTick, PAUSE_WATCH_MS); }
+	if (window.__pauseWatchBound) { return; }
+	window.__pauseWatchBound = true;
+	// A phone in a pocket keeps the tab hidden, and a frozen timer never fires;
+	// unlocking it is exactly when the customer finds out the code is gone.
+	// pageshow covers a back/forward-cache restore of an old paused page.
+	try {
+		document.addEventListener("visibilitychange", function () { if (!document.hidden) { pauseWatchTick(); } });
+	} catch (e) { }
+	try {
+		window.addEventListener("pageshow", function () { pauseWatchTick(); });
+		window.addEventListener("focus", function () { pauseWatchTick(); });
+	} catch (e) { }
 }
 
 function resumeSession() {
@@ -2617,7 +2674,9 @@ function resumeSession() {
 			removeActiveVoucher();
 			voucher = "";
 			try { removePausedFlag(); } catch (e) {}
-			try { $("#voucherInput").val(""); } catch (e) {}
+			// The box keeps the code that was just submitted. The page is about
+			// to reload anyway, and an empty field makes the customer retype a
+			// code they still have in their hand.
 			try { dbgLog("resume: uptime/traffic exhausted, voucher cleared", "dbg-err"); } catch (e) { }
 			$.toast({ title: 'Expired', content: (spentVoucher ? ("Your " + spentVoucher + " time has all been used") : "This code has used up all its time"), type: 'error', delay: 5000 });
 		} else if (em.indexOf("invalid username or password") !== -1 || em.indexOf("invalid-username") !== -1 || em.indexOf("wrong password") !== -1) {
@@ -2650,7 +2709,8 @@ function resumeSession() {
 			removeActiveVoucher();
 			voucher = "";
 			try { removePausedFlag(); } catch (e) {}
-			try { $("#voucherInput").val(""); } catch (e) {}
+			// Left in the box on purpose: the customer can fix a typo instead of
+			// retyping the whole code from the voucher.
 			try { dbgLog("resume: wrong username or password, voucher cleared", "dbg-err"); } catch (e) { }
 			$.toast({ title: 'Invalid voucher', content: "That code is not valid, please check it and try again", type: 'error', delay: 6000 });
 		} else if (em.indexOf("this mac address is not yours") !== -1 || em.indexOf("not allowed to log in from this mac") !== -1) {
@@ -2660,7 +2720,8 @@ function resumeSession() {
 			removeActiveVoucher();
 			voucher = "";
 			try { removePausedFlag(); } catch (e) {}
-			try { $("#voucherInput").val(""); } catch (e) {}
+			// Kept in the box like the other rejections: the customer sees which
+			// code was refused.
 			try { dbgLog("resume: code locked to another MAC, voucher cleared", "dbg-err"); } catch (e) { }
 			$.toast({ title: 'Wrong device', content: "This code is tied to another device and cannot be used here", type: 'error', delay: 6000 });
 		} else if ((function () {
@@ -2975,16 +3036,35 @@ function callTopupAPI(retryCount, gen) {
 	var isExtend = $("#saveVoucherButton").attr('data-save-type') == "extend";
 	try { dbgLog("topUp start retry=" + retryCount + " extend=" + (isExtend ? "1" : "0")); } catch (e) { }
 
-	// With MAC-as-voucher the pre-fill IS the code being bought, so it
-	// must survive a fresh insert - otherwise the topUp posts an empty
-	// voucher and the box mints a random code again.
-	if (retryCount === 0 && !isExtend && totalCoinReceived == 0 && !macAsVoucherCode) {
-		var storedVoucher = getActiveVoucher();
-		if (storedVoucher != null) {
-			// Stash, don't wipe: the fresh post still sends voucher:"",
-			try { window.__stashedVoucher = storedVoucher; } catch (e) {}
-			voucher = "";
-			$("#voucherInput").val('');
+	// Reuse the code, don't mint a new one. An insert that has a code in hand
+	// extends THAT code: the vendo only makes a fresh one when the voucher
+	// argument is empty. Every unnecessary new code costs a RouterOS hotspot
+	// user that is never deleted unless it is logged into (expiry is created
+	// on first login), and it burns a value out of the vendo's 1000-9999 code
+	// space - so reuse is what keeps the voucher space from running out.
+	if (retryCount === 0 && !isExtend && totalCoinReceived == 0) {
+		// Best first: what the customer sees in the box (their code), then the
+		// code this page is holding, then the venue-scoped stored one. Anything
+		// left after that means a genuinely new customer, and the vendo
+		// generates the code for them.
+		var reuse = "";
+		try { reuse = String($("#voucherInput").val() || "").trim(); } catch (e) {}
+		if (!reuse) { try { reuse = String(voucher || "").trim(); } catch (e) {} }
+		if (!reuse) { try { reuse = String(getActiveVoucher() || "").trim(); } catch (e) {} }
+		// A free-trial code is never extended with paid time: trialNoExtend
+		// already hides EXTEND for them, and buying onto the trial code here
+		// would hand out a paid voucher the operator never priced. Leave it
+		// empty so the vendo mints a normal code for the purchase.
+		try {
+			if (reuse && typeof trialNoExtend !== "undefined" && trialNoExtend && reuse.indexOf("T-") === 0) {
+				reuse = "";
+				try { dbgLog("topUp: trial code not extended, buying new"); } catch (e2) {}
+			}
+		} catch (e) {}
+		if (reuse) {
+			voucher = reuse;
+			try { window.__stashedVoucher = null; } catch (e) {}
+			try { dbgLog("topUp: reusing code " + reuse); } catch (e) {}
 		}
 	}
 
@@ -3396,7 +3476,11 @@ function newLogin() {
 // Pause / resume.
 
 function pause() {
-	var vc = getActiveVoucher();
+	// The code in hand wins over the stored one. They only disagree when a
+	// login with a new code could not be read back from the status page;
+	// then banking against storage logged the customer back into the OLD
+	// voucher on RESUME.
+	var vc = voucher || getActiveVoucher();
 	// PAUSE tears the coin flow down below (poll stopped, XHRs aborted, coins
 	// zeroed), so the unload guard must come off with it -- otherwise every
 	// later navigation asks to leave and PAUSE looks broken.
@@ -3462,7 +3546,9 @@ function pause() {
 }
 
 function resume() {
-	var vc = getActiveVoucher() || voucher;
+	// Same precedence as pause(): the code this page knows about beats a
+	// stale stored one.
+	var vc = voucher || getActiveVoucher();
 	try { dbgLog("resume: " + (vc ? "relogin len=" + vc.length : "no voucher, reload")); } catch (e) { }
 	insertingCoin = false;
 	// Keep the flag until the router rules on the code: dropping it first
