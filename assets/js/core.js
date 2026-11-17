@@ -2501,48 +2501,35 @@ function clearStalePause(msg) {
 		}
 	} catch (e) {}
 }
-// A pause can outlive the code it was holding. The per-MAC session file is
-// the only client-side signal that the code still exists: On-Login writes it,
-// the expiry scheduler deletes it. Resolves true when RESUME may go ahead,
-// false when it must send the customer back to the login view instead.
+// May RESUME go ahead? The only thing this page knows for certain is how much
+// time pause() banked. Everything else -- whether the router still honours the
+// code -- is settled by the login attempt itself, because the router is the
+// authority and resumeSession() already turns its refusal into "Expired" or
+// "Invalid voucher" on the login view.
 //
-// Read-only on purpose. This used to run on every boot and every 30s, and it
-// cleared the pause behind the customer's back: a refresh, or simply coming
-// back to the tab, threw them off the paused view with "session not valid"
-// before they had tapped anything. The paused view now stays put, and the
-// verdict is asked exactly once -- when RESUME is tapped.
+// An earlier pass guessed from data/<mac>.txt and guessed wrong: a code made
+// by hand in MikroTik has no session file of its own, so RESUME concluded the
+// code was gone and sent a perfectly good voucher to the login page. Only
+// banked time can block now.
+//
+// Read-only on purpose: this used to run on every boot and every 30s and clear
+// the pause behind the customer's back, so a refresh threw them off the paused
+// view before they had tapped anything. It is asked once, when RESUME is
+// tapped.
 function pauseCanResume() {
 	var d = $.Deferred();
 	if (getPausedFlag() != "1") { d.resolve(true); return d.promise(); }
 	// Paused at 00:00:00: pause() banked zero seconds, so there is nothing to
-	// resume into. The router session file can outlive the purchased session,
-	// so the file test below alone would let a RESUME that can only fail
-	// through. -1 is pause()'s "remaining unknown" marker.
+	// resume into and submitting would only show the router's error page.
+	// -1 is pause()'s "remaining unknown" marker and must not block.
 	var banked = parseInt(getVouchValue(voucher || getActiveVoucher(), "remain"), 10);
 	if (banked === 0) {
 		try { dbgLog("resume check: no time left to resume"); } catch (e) {}
 		d.resolve(false);
 		return d.promise();
 	}
-	$.ajax({ type: "GET", url: "/data/" + macNoColon() + ".txt?query=" + new Date().getTime(), timeout: ROUTER_TIMEOUT })
-	.done(function (data) {
-		var str = String(data == null ? "" : data);
-		var hash = str.lastIndexOf("#");
-		var fv = (hash < 0 ? str : str.slice(0, hash)).trim();
-		var vu = hash < 0 ? null : parseValidity(str.slice(hash + 1));
-		var ok = (fv != "" && vu != null && vu.getTime() >= new Date().getTime());
-		try { dbgLog("resume check: " + (ok ? "session file still valid" : "session file empty or past")); } catch (e) {}
-		d.resolve(ok);
-	})
-	.fail(function (jqXHR) {
-		// A 404 is the router answering, not the network failing: the file was
-		// deleted with the voucher. Any other status is a hiccup and no proof
-		// at all, so the RESUME goes ahead and the router rules on the code.
-		var gone = false;
-		try { gone = (jqXHR && jqXHR.status === 404); } catch (e) {}
-		try { dbgLog("resume check: file fetch " + (gone ? "404, code gone" : "failed, letting the login decide")); } catch (e) {}
-		d.resolve(!gone);
-	});
+	try { dbgLog("resume check: " + (isFinite(banked) ? banked + "s banked" : "remaining unknown") + ", asking the router"); } catch (e) {}
+	d.resolve(true);
 	return d.promise();
 }
 
@@ -3514,17 +3501,19 @@ function resume() {
 	// Same precedence as pause(): the code this page knows about beats a
 	// stale stored one.
 	var vc = voucher || getActiveVoucher();
+	// Last resort before calling it lost: the box may be the only place the
+	// code survived a repaint of the paused view.
+	if (!vc) { try { vc = String($("#voucherInput").val() || ""); } catch (e) { } }
 	try { dbgLog("resume: " + (vc ? "relogin len=" + vc.length : "no voucher, reload")); } catch (e) { }
 	insertingCoin = false;
 	// Keep the flag until the router rules on the code: dropping it first
 	// made a failed RESUME land on the login view with the pause forgotten,
 	// and the next refresh would auto-login anyway.
 	if (!vc) { removePausedFlag(); location.reload(); return; }
-	// Look at the session file before submitting anything. A pause can outlive
-	// the code it held; submitting a dead one lands on the router's login page
-	// with an error the customer did not ask for. Checking first sends them
-	// straight to the login view when the code is gone, and leaves a good code
-	// alone on the way to the status page.
+	// One last look before submitting: banked time is the only thing this page
+	// can judge, and a pause with nothing left in it is not worth a round trip
+	// to the router. A code the router no longer honours gets refused there,
+	// and resumeSession() shows the customer the login view with the reason.
 	var rbtn = null;
 	try { rbtn = $("#resumeBtn"); rbtn.prop("disabled", true); } catch (e) {}
 	pauseCanResume().always(function () {
