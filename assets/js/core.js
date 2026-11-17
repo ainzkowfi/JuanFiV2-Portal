@@ -2896,11 +2896,27 @@ function showValidity() {
 			}
 		var str = String(data);
 		var hash = str.lastIndexOf("#");
+		var fileVoucher = (hash < 0 ? str : str.slice(0, hash)).trim();
 		var t = hash < 0 ? null : parseValidity(str.slice(hash + 1));
 		if (t == null) {
 			try { dbgLog("validity: unparseable, No expiry"); } catch (e) { }
 			renderExpiration("No expiry");
 			d.resolve();
+			return;
+		}
+		// "user#validUntil" is one code's session record, and only the vendo's
+		// on-login writes it (it works from the sale comment a purchase leaves
+		// behind). A code made by hand in MikroTik never gets a file of its
+		// own, so on a phone that held an earlier code the leftover file is
+		// still there with a date long past -- and the dashboard called a
+		// perfectly healthy manual code "expired" while the session ran on.
+		// A past date cannot be about this session either: the router ends a
+		// code by deleting this very file, so a status page still being served
+		// means the date is stale, never that the customer is out of time.
+		var ours = (!fileVoucher || !voucher || fileVoucher === voucher);
+		if (!ours || t.getTime() < new Date().getTime()) {
+			try { dbgLog("validity: " + t.toLocaleString() + " is not this session's expiry, ignored"); } catch (e) { }
+			if (fallbackValidity()) { d.resolve(); } else { renderExpiration("No expiry"); d.resolve(); }
 			return;
 		}
 		try { dbgLog("validity: file " + t.toLocaleString()); } catch (e) { }
