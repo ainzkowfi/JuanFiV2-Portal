@@ -1,0 +1,4 @@
+:if ($cause="session timeout") do={
+  :local jfNow [/system clock get time];
+  :do { /system scheduler set [find name="$user"] interval=5s start-date=[/system clock get date] start-time=($jfNow + 5s) } on-error={ :log warning ("On-Logout(" . $user . "): scheduler timeout set failed") };
+}
